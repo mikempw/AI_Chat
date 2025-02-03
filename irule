@@ -1,0 +1,270 @@
+when RULE_INIT {
+    # Initialize arrays directly instead of using array set
+    set static::code_patterns(python) {
+        def\s+\w+\s*\(
+        class\s+\w+\s*:
+        import\s+[\w\.]+
+        from\s+\w+\s+import
+        @\w+
+        if\s+__name__\s*==\s*['"]__main__['"]
+        try:\s*except
+        raise\s+\w+
+        async\s+def
+        yield\s+
+    }
+
+    set static::code_patterns(javascript) {
+        function\s+\w+\s*\(
+        const\s+\w+\s*=
+        let\s+\w+\s*=
+        class\s+\w+\s*\{
+        =>\s*\{
+        module\.exports
+        require\s*\(['"]
+        import\s+.*?from
+        async\s+function
+        Promise\.
+    }
+
+    set static::code_patterns(java) {
+        public\s+class\s+\w+
+        private\s+\w+\s+\w+\s*\(
+        protected\s+\w+\s+\w+\s*\(
+        package\s+[\w\.]+
+        @Override
+        new\s+\w+
+        interface\s+\w+
+        extends\s+\w+
+        implements\s+\w+
+        throw\s+new
+    }
+
+    set static::code_patterns(sql) {
+        SELECT\s+.*?FROM
+        INSERT\s+INTO
+        UPDATE\s+\w+
+        DELETE\s+FROM
+        CREATE\s+TABLE
+        ALTER\s+TABLE
+        DROP\s+TABLE
+        JOIN\s+\w+
+        WHERE\s+
+        GROUP\s+BY
+    }
+
+    set static::ai_messages(openai) {
+        messages":\s*\[.*?\]
+        role":\s*"(user|system|assistant)"
+        content":\s*".*?"
+        max_tokens
+        temperature
+        top_p
+        frequency_penalty
+        presence_penalty
+        stop":\s*\[
+        model":\s*"gpt
+    }
+
+    set static::ai_messages(anthropic) {
+        prompt":\s*".*?"
+        system":\s*".*?"
+        messages":\s*\[.*?\]
+        model":\s*"claude
+        max_tokens_to_sample
+        temperature
+        top_k
+        top_p
+        Human:\s*
+        Assistant:\s*
+    }
+
+    set static::ai_messages(generic) {
+        assistant.*?should
+        you.*?are.*?now
+        act.*?as.*?a
+        pretend.*?to.*?be
+        your.*?role.*?is
+        you.*?must.*?respond
+    }
+
+    set static::data_patterns(sensitive) {
+        \b\d{16}\b
+        \b\d{3}-\d{2}-\d{4}\b
+        (?:[0-9]{1,3}\.){3}[0-9]{1,3}
+        \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b
+    }
+
+    set static::data_patterns(encoded) {
+        [A-Za-z0-9+/]{100,}={0,2}
+        eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*
+        [a-fA-F0-9]{32}
+        [a-fA-F0-9]{40}
+        [a-fA-F0-9]{64}
+    }
+
+    set static::data_patterns(api_keys) {
+        sk-[a-zA-Z0-9]{48}
+        github_pat_[a-zA-Z0-9]{82}
+        ghp_[a-zA-Z0-9]{36}
+        xox[pbar]-[0-9]{12}-[0-9]{12}
+        aws[_-][a-zA-Z0-9]{20}
+    }
+
+    set static::ai_endpoints(openai) {
+        chat.openai.com
+        api.openai.com
+        platform.openai.com
+        oai.hconeai.com
+        openai.azure.com
+    }
+
+    set static::ai_endpoints(anthropic) {
+        claude.ai
+        api.anthropic.com
+        console.anthropic.com
+    }
+
+    set static::ai_endpoints(google) {
+        bard.google.com
+        generativelanguage.googleapis.com
+        ai.google.dev
+    }
+
+    set static::ai_endpoints(microsoft) {
+        copilot.microsoft.com
+        chat.bing.com
+        azure.microsoft.com/cognitive
+    }
+
+    set static::ai_endpoints(other) {
+        huggingface.co
+        api.cohere.ai
+        api.stability.ai
+    }
+}
+
+when CLIENT_ACCEPTED {
+    set client_ip [IP::client_addr]
+    set flow_key "${client_ip}_[TCP::local_port]"
+    table set -subtable "stream_buffer" $flow_key "" 3600
+}
+
+when HTTP_REQUEST {
+    set flow_key "${client_ip}_[TCP::local_port]"
+    table set -subtable "request_data" $flow_key [HTTP::uri] 3600
+    
+    switch -glob [string tolower [HTTP::header "Content-Type"]] {
+        "*json*" - "*javascript*" - "*text*" - "*xml*" {
+            HTTP::collect 1048576
+        }
+        "*multipart*" {
+            HTTP::collect 5242880
+        }
+        default {
+            HTTP::collect 524288
+        }
+    }
+}
+
+when HTTP_REQUEST_DATA {
+    set flow_key "${client_ip}_[TCP::local_port]"
+    set chunk [HTTP::payload]
+    
+    # Append to stream buffer
+    if { [table lookup -subtable "stream_buffer" $flow_key] ne "" } {
+        append stream [table lookup -subtable "stream_buffer" $flow_key] $chunk
+    } else {
+        set stream $chunk
+    }
+    table set -subtable "stream_buffer" $flow_key $stream
+    
+    # Initialize detection arrays
+    array set detections {
+        code_patterns {}
+        ai_messages {}
+        data_patterns {}
+    }
+    
+    # Check code patterns
+    foreach lang [array names static::code_patterns] {
+        foreach pattern $static::code_patterns($lang) {
+            if { [regexp $pattern $stream] } {
+                lappend detections(code_patterns) "$lang"
+                log local0. "Code pattern detected - Language: $lang"
+            }
+        }
+    }
+    
+    # Check AI messages
+    foreach type [array names static::ai_messages] {
+        foreach pattern $static::ai_messages($type) {
+            if { [regexp $pattern $stream] } {
+                lappend detections(ai_messages) "$type"
+                log local0. "AI message detected - Type: $type"
+            }
+        }
+    }
+    
+    # Check data patterns
+    foreach type [array names static::data_patterns] {
+        foreach pattern $static::data_patterns($type) {
+            if { [regexp $pattern $stream] } {
+                lappend detections(data_patterns) "$type"
+                log local0. "Sensitive data detected - Type: $type"
+            }
+        }
+    }
+    
+    # Check AI endpoints
+    set host [HTTP::host]
+    set ai_endpoint_detected 0
+    foreach provider [array names static::ai_endpoints] {
+        foreach endpoint $static::ai_endpoints($provider) {
+            if { [string match "*$endpoint*" $host] } {
+                set ai_endpoint_detected 1
+                log local0. "AI endpoint detected: $provider"
+                HTTP::header insert "X-AI-Endpoint-Detection" "$provider"
+            }
+        }
+    }
+    
+    # Take action based on detections
+    if { [llength $detections(code_patterns)] > 0 || 
+         [llength $detections(ai_messages)] > 0 || 
+         [llength $detections(data_patterns)] > 0 } {
+        
+        # Add detection headers
+        if { [llength $detections(code_patterns)] > 0 } {
+            HTTP::header insert "X-Code-Detection" [join $detections(code_patterns) ","]
+        }
+        if { [llength $detections(ai_messages)] > 0 } {
+            HTTP::header insert "X-AI-Message-Detection" [join $detections(ai_messages) ","]
+        }
+        if { [llength $detections(data_patterns)] > 0 } {
+            HTTP::header insert "X-Data-Detection" [join $detections(data_patterns) ","]
+        }
+        
+        # Log comprehensive detection
+        log local0. "Detection on [HTTP::uri] - IP: $client_ip, Code: [join $detections(code_patterns) ","], AI: [join $detections(ai_messages) ","], Data: [join $detections(data_patterns) ","]"
+        
+        # Optional: Block based on policy
+        switch -glob [HTTP::uri] {
+            "*/internal/*" - "*/secure/*" - "*/confidential/*" {
+                HTTP::respond 403 content "Request blocked due to security policy"
+                return
+            }
+        }
+    }
+}
+
+when HTTP_RESPONSE {
+    HTTP::collect 524288
+}
+
+when HTTP_RESPONSE_DATA {
+    set flow_key "${client_ip}_[TCP::local_port]"
+    
+    # Clean up
+    table delete -subtable "stream_buffer" $flow_key
+    table delete -subtable "request_data" $flow_key
+}
