@@ -72,7 +72,7 @@ when HTTP_REQUEST {
 
                 # Send HTTP request to AST container asynchronously
                 set ast_request "POST / HTTP/1.1\r\nHost: python-analyzer:5000\r\nContent-Type: application/json\r\nContent-Length: [string length "{\"code\": \"$request_body\"}"]\r\n\r\n{\"code\": \"$request_body\"}"
-                set response [CRYPTO::http $static::ast_analyzer $ast_request]
+                set response [HTTP::request $static::ast_analyzer $ast_request]
 
                 log local0. "AST Analysis Response: $response"
 
