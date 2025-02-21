@@ -1,0 +1,15 @@
+services:
+  bot-chat-inspection-container-python-analyzer:
+    build: .
+    container_name: python-analyzer
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/var/log/  # Persistent logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      retries: 3
