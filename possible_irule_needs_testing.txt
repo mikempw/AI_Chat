@@ -1,0 +1,107 @@
+when RULE_INIT {
+    # Define monitored AI domains
+    set static::monitored_domains {
+        chat.openai.com
+        claude.ai
+        api.anthropic.com
+        bard.google.com
+        gemini.google.com
+        chat.google.com
+        pi.ai
+        chat.mistral.ai
+    }
+    
+    # Define AST Analyzer container URL
+    set static::ast_analyzer "http://python-analyzer:5000/"
+}
+
+when CLIENT_ACCEPTED {
+    # Track client session
+    set client_ip [IP::client_addr]
+    set client_port [TCP::client_port]
+    set flow_key "${client_ip}_${client_port}"
+    table set -subtable "stream_flows" $flow_key 1 300
+    STREAM::enable
+}
+
+when HTTP_RESPONSE_RELEASE {
+    # Cleanup tracking table on response release
+    set client_ip [IP::client_addr]
+    set client_port [TCP::client_port]
+    set flow_key "${client_ip}_${client_port}"
+    catch { table delete -subtable "stream_flows" $flow_key }
+}
+
+when HTTP_REQUEST {
+    # Enable streaming and check if request matches AI domains
+    STREAM::enable
+    set inspect_request 0
+    
+    set host [HTTP::host]
+    foreach domain $static::monitored_domains {
+        if { [string match "*$domain*" $host] } {
+            log local0. "AI platform detected: $host - Enabling monitoring"
+            STREAM::enable
+            set inspect_request 1
+            break
+        }
+    }
+
+    # Detect streaming connections
+    if { [HTTP::header exists "Upgrade"] && [string tolower [HTTP::header "Upgrade"]] eq "websocket" } {
+        log local0. "WebSocket connection detected: $host"
+        set chatgpt_connection "websocket"
+    }
+
+    if { [HTTP::header exists "Accept"] && [HTTP::header "Accept"] contains "text/event-stream" } {
+        log local0. "SSE (Server-Sent Events) detected: $host"
+        set chatgpt_connection "sse"
+    }
+
+    if { [HTTP::version] eq "2.0" } {
+        log local0. "HTTP/2 Long Polling detected: $host"
+        set chatgpt_connection "http2"
+    }
+
+    # If flagged for AI analysis, delay execution for async request handling
+    if { $inspect_request == 1 } {
+        after 100 { eval [subst {
+            set request_body [table lookup -subtable "ai_requests" [IP::client_addr]]
+            if { $request_body ne "" } {
+                log local0. "Sending AI request body to AST Analyzer: $request_body"
+
+                # Send HTTP request to AST container asynchronously
+                set ast_request "POST / HTTP/1.1\r\nHost: python-analyzer:5000\r\nContent-Type: application/json\r\nContent-Length: [string length "{\"code\": \"$request_body\"}"]\r\n\r\n{\"code\": \"$request_body\"}"
+                set response [CRYPTO::http $static::ast_analyzer $ast_request]
+
+                log local0. "AST Analysis Response: $response"
+
+                # Check if AST detected risky code
+                if { $response contains "\"status\": \"suspicious\"" } {
+                    log local0. "Blocked: AI message contained code!"
+                    HTTP::respond 403 content "Code submissions are not allowed on AI platforms."
+                    return
+                }
+            }
+        }] }
+    }
+}
+
+when HTTP_REQUEST_DATA {
+    # Capture request body for AI platforms
+    if { $inspect_request == 1 } {
+        # Collect up to 500 bytes of request body
+        HTTP::collect 500  
+        set request_body [HTTP::payload]
+        table set -subtable "ai_requests" [IP::client_addr] $request_body 60
+        log local0. "Captured AI request body for later inspection."
+    }
+}
+
+when HTTP_RESPONSE {
+    STREAM::enable
+}
+
+when HTTP_REQUEST_SEND {
+    STREAM::enable
+}
